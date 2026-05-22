@@ -1,0 +1,97 @@
+#!/bin/bash
+# =============================================================================
+# Git Post-Commit Hook: Auto-sync watched files to a config remote
+# =============================================================================
+# Place this file at:  .git/hooks/post-commit
+# Make executable:     chmod +x .git/hooks/post-commit
+# =============================================================================
+
+# ── CONFIGURATION (edit these to suit your project) ───────────────────────────
+
+# File to watch — change this to any file you want to sync
+WATCH_FILE="appsetting.json"
+
+# Name of the remote that holds your config-only repo
+# Set it up once with:
+#   git remote add config-repo https://github.com/chinosuka21/Test_PG_config.git
+CONFIG_REMOTE="config-repo"
+
+# Branch to create/push in the config repo
+CONFIG_BRANCH="main"
+
+# Commit message prefix written into the config repo on each sync
+COMMIT_PREFIX="sync"
+
+# ── END OF CONFIGURATION ──────────────────────────────────────────────────────
+
+MAIN_REPO=$(git rev-parse --show-toplevel)
+
+echo "[post-commit] Watching '${WATCH_FILE}' for changes..."
+
+# ── Detect whether WATCH_FILE changed in this commit ──────────────────────────
+if git rev-parse --verify HEAD~1 > /dev/null 2>&1; then
+    CHANGED_FILES=$(git diff-tree --no-commit-id -r --name-only HEAD)
+else
+    CHANGED_FILES=$(git ls-tree --name-only -r HEAD)
+fi
+
+if ! echo "$CHANGED_FILES" | grep --quiet "^${WATCH_FILE}$"; then
+    echo "[post-commit] '${WATCH_FILE}' not modified. Skipping sync."
+    exit 0
+fi
+
+echo "[post-commit] '${WATCH_FILE}' changed. Syncing to '${CONFIG_REMOTE}/${CONFIG_BRANCH}'..."
+
+# ── Resolve the remote URL ────────────────────────────────────────────────────
+CONFIG_URL=$(git remote get-url "${CONFIG_REMOTE}" 2>/dev/null)
+if [ -z "$CONFIG_URL" ]; then
+    echo "[post-commit] ERROR: Remote '${CONFIG_REMOTE}' is not configured." >&2
+    echo "[post-commit] Run: git remote add ${CONFIG_REMOTE} <url>" >&2
+    exit 1
+fi
+
+# ── Extract the file content from the current commit ─────────────────────────
+FILE_CONTENT=$(git show HEAD:"${WATCH_FILE}")
+
+# ── Clone config repo into a temp directory ───────────────────────────────────
+TMPCLONE=$(mktemp -d)
+trap "rm -rf '${TMPCLONE}'" EXIT
+
+if git clone "$CONFIG_URL" "$TMPCLONE/config" 2>/dev/null; then
+    cd "$TMPCLONE/config"
+else
+    # Empty / brand-new repo on GitHub — init locally
+    git init "$TMPCLONE/config"
+    cd "$TMPCLONE/config"
+    git remote add origin "$CONFIG_URL"
+fi
+
+# Copy identity from main repo
+git config user.email "$(git -C "${MAIN_REPO}" config user.email)"
+git config user.name  "$(git -C "${MAIN_REPO}" config user.name)"
+
+# Always checkout (or create) the target branch — this fixes detached HEAD
+git checkout -B "${CONFIG_BRANCH}" 2>/dev/null || git checkout -b "${CONFIG_BRANCH}" 2>/dev/null
+
+# ── Write ONLY the watched file — nothing else ───────────────────────────────
+echo "$FILE_CONTENT" > "${WATCH_FILE}"
+git add "${WATCH_FILE}"
+
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+COMMIT_MSG="${COMMIT_PREFIX}: ${WATCH_FILE} updated (${TIMESTAMP})"
+
+if ! git commit -m "$COMMIT_MSG" 2>/dev/null; then
+    echo "[post-commit] '${WATCH_FILE}' unchanged in '${CONFIG_REMOTE}'. Nothing to sync."
+    exit 0
+fi
+
+# ── Force-push to the named branch ───────────────────────────────────────────
+if git push --force --set-upstream origin "${CONFIG_BRANCH}" 2>&1; then
+    echo "[post-commit] '${WATCH_FILE}' synced to '${CONFIG_REMOTE}/${CONFIG_BRANCH}' successfully."
+else
+    echo "[post-commit] ERROR: Push to '${CONFIG_REMOTE}' failed." >&2
+    echo "[post-commit] Check your credentials and write access to: ${CONFIG_URL}" >&2
+    exit 1
+fi
+
+exit 0
